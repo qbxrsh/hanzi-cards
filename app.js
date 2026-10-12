@@ -352,7 +352,8 @@ function openEditor(deckId, cardId) {
         <div class="search">
           <input id="edSearch" placeholder="иероглиф или пиньинь: hao, nihao…" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
         </div>
-        <div class="sugg" id="edSugg"></div>`}
+        <div class="sugg" id="edSugg"></div>
+        <button class="link to-bulk" id="edBulk" type="button">📄 Много слов или файл .txt/.docx? Добавить списком ›</button>`}
         <label class="lbl" for="edHanzi">Иероглиф</label>
         <input id="edHanzi" class="big" lang="zh" autocomplete="off" value="${esc(card?.hanzi)}">
         <label class="lbl" for="edPinyin">Пиньинь</label>
@@ -482,6 +483,7 @@ function openEditor(deckId, cardId) {
     };
     loadDict().catch(() => {});
     setTimeout(() => search.focus(), 300);
+    $('#edBulk', ov).onclick = () => { close(); openBulk(deckId); };
   }
 
   $('#edSave', ov).onclick = () => {

@@ -167,10 +167,12 @@ function fixCase(h, s) {
 // Google translates single words through English, so 火车 ("train") can come back as
 // "тренироваться". When Google offers several variants, MyMemory picks between them.
 // skipGoogle: Google is already refusing us, so go straight to MyMemory.
-async function translateWord(h, { skipGoogle = false } = {}) {
+// onGoogle(main): called as soon as Google answers, before the slower MyMemory check.
+async function translateWord(h, { skipGoogle = false, onGoogle = null } = {}) {
   const norm = s => s.toLowerCase().replace(/ё/g, 'е').replace(/[.。!]+$/, '').trim();
   let g = null, gErr = null, mm = '';
   if (!skipGoogle) { try { g = await googleTranslate(h, 'zh-CN'); } catch (e) { gErr = e; } }
+  if (g && onGoogle) onGoogle(fixCase(h, g.main));
   if (!g || g.alts.length > 1) { try { mm = cleanMyMemory(await myMemory(h)); } catch {} }
   let main;
   if (g) main = (mm && g.alts.find(a => norm(a) === norm(mm))) || g.main;
@@ -473,8 +475,17 @@ function openEditor(deckId, cardId) {
     if (!h) return;
     if (!st.trTouched) { tr.value = ''; tr.placeholder = 'перевожу…'; }
     try {
-      const res = await translateWord(h);
-      const enRu = entry?.en ? await googleTranslate(entry.en, 'en').then(r => r.main, () => '') : '';
+      // show Google's answer at once; MyMemory's pick and the extra meanings arrive in parallel
+      const [res, enRu] = await Promise.all([
+        translateWord(h, {
+          onGoogle: main => {
+            if (my !== st.trToken || st.trTouched) return;
+            tr.value = main;
+            tr.placeholder = '';
+          },
+        }),
+        entry?.en ? googleTranslate(entry.en, 'en').then(r => r.main, () => '') : '',
+      ]);
       if (my !== st.trToken) return;
       if (!st.trTouched) tr.value = res.main;
       if (res.source === 'mymemory') toast('Google не ответил — перевод из запасного словаря, проверь его');
@@ -508,7 +519,7 @@ function openEditor(deckId, cardId) {
       if (!st.pyTouched) py.value = toPinyin(hz.value.trim());
       updatePreview();
       if (!st.trTouched) autoTranslate();
-    }, 450);
+    }, 300);
   });
   py.addEventListener('input', () => { st.pyTouched = true; });
   tr.addEventListener('input', () => { st.trTouched = true; });

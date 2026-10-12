@@ -146,6 +146,7 @@ a { color: inherit; text-decoration: none; }
 .card3d.flipped .face.front { visibility: hidden; }
 .front-h { font-size: clamp(64px, 26vw, 150px); line-height: 1.15; text-align: center; word-break: break-all; }
 .front-tr { font-size: 28px; font-weight: 600; text-align: center; }
+.front-en { font-size: 17px; color: var(--muted); text-align: center; margin-top: 10px; max-width: 90%; }
 .hint { position: absolute; bottom: 16px; font-size: 13px; color: var(--muted); }
 .writers { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 4px; }
 .tools { display: flex; gap: 10px; }

@@ -1011,7 +1011,7 @@ function showCard() {
   if (!c) { S.queue.shift(); S.total--; return showCard(); }
 
   const front = prefs.front === 'tr'
-    ? `<div class="front-tr">${esc(c.translation || c.en || '—')}</div>`
+    ? `<div class="front-tr">${esc(c.translation || c.en || '—')}</div>${c.translation && c.en ? `<div class="front-en">${esc(c.en)}</div>` : ''}`
     : `<div class="front-h" lang="zh">${esc(c.hanzi)}</div>`;
   main.innerHTML = `
     <div class="stage"><div class="card3d" id="card">

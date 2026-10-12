@@ -26,8 +26,10 @@ self.addEventListener('fetch', e => {
   const url = new URL(req.url);
 
   if (url.origin === location.origin) {
+    // no-cache: revalidate with the server every time (cheap 304 if unchanged), so a new
+    // upload to GitHub Pages shows up on the next launch instead of after its 10-minute cache
     e.respondWith(
-      fetch(req)
+      fetch(req, { cache: 'no-cache' })
         .then(res => { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); return res; })
         .catch(() => caches.match(req, { ignoreSearch: true }))
     );

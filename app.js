@@ -100,38 +100,80 @@ function toPinyin(h) {
 }
 
 /* ---------- translation (Google, fallback MyMemory) ---------- */
-async function googleTranslate(text, from) {
-  const r = await fetch('https://translate.googleapis.com/translate_a/single?client=gtx&sl=' + from + '&tl=ru&dt=t&dt=at&q=' + encodeURIComponent(text));
-  if (!r.ok) throw new Error(r.status);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Google refuses bursts of parallel requests, so every Google request goes through
+// one queue: one at a time with a short gap, and up to 3 retries with a growing pause.
+const GOOGLE_GAP_MS = 150;
+let googleChain = Promise.resolve();
+function inGoogleQueue(fn) {
+  const p = googleChain.then(fn, fn);
+  googleChain = p.catch(() => {}).then(() => sleep(GOOGLE_GAP_MS));
+  return p;
+}
+
+async function googleOnce(text, from) {
+  let r;
+  try {
+    r = await fetch('https://translate.googleapis.com/translate_a/single?client=gtx&sl=' + from + '&tl=ru&dt=t&dt=at&q=' + encodeURIComponent(text),
+      window.AbortSignal && AbortSignal.timeout ? { signal: AbortSignal.timeout(10000) } : {});
+  } catch {
+    // a refused request (e.g. 429) often arrives without CORS headers, so fetch only sees a network error
+    throw new Error(navigator.onLine === false ? 'нет сети' : 'Google не ответил');
+  }
+  if (!r.ok) throw new Error('Google: ошибка ' + r.status);
   const j = await r.json();
-  const alts = Array.isArray(j[5]) && j[5].length === 1 ? (j[5][0][2] || []).map(a => a[0]) : [];
+  const alts = Array.isArray(j[5]) && j[5].length === 1 ? (j[5][0][2] || []).filter(Array.isArray).map(a => a[0]) : [];
   return { main: j[0].map(x => x[0]).join('').trim(), alts };
 }
-async function myMemory(text, from) {
-  const r = await fetch('https://api.mymemory.translated.net/get?langpair=' + (from === 'en' ? 'en' : 'zh-CN') + '|ru&q=' + encodeURIComponent(text));
+
+async function googleTranslate(text, from) {
+  let err;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (attempt) await sleep(600 * 2 ** (attempt - 1)); // 0.6 s, 1.2 s, 2.4 s
+    try { return await inGoogleQueue(() => googleOnce(text, from)); }
+    catch (e) { err = e; if (e.message === 'нет сети') break; }
+  }
+  throw err;
+}
+
+async function myMemory(text) {
+  const r = await fetch('https://api.mymemory.translated.net/get?langpair=zh-CN|ru&q=' + encodeURIComponent(text));
   const j = await r.json();
   return (j.responseData?.translatedText || '').trim();
 }
-async function translate(text, from) {
-  try { return (await googleTranslate(text, from)).main; }
-  catch { return myMemory(text, from); }
+
+// MyMemory is a memory of human translations (subtitles, documents), so for single words it
+// often returns junk: "Эм-м-м...", "RAW", "ЭЛЕКТРОМОНТАЖНИКА", half a sentence. Empty beats junk.
+function cleanMyMemory(s) {
+  s = (s || '').trim().replace(/(\.{3}|…)+$/, '').replace(/[.!]+$/, '').trim();
+  if (!/[а-яё]/i.test(s)) return '';                          // nothing Russian
+  if (/[a-z]/i.test(s)) return '';                             // Latin mixed in
+  if (s.length > 1 && s === s.toUpperCase()) return '';        // ALL CAPS
+  if (s.length > 40 || s.split(/\s+/).length > 4) return '';  // a sentence, not a word
+  if (/(\p{L})-\1/iu.test(s)) return '';                       // stammering "м-м-м"
+  return s;
 }
+
+// Lower-case a capitalised first letter ("Открыть" → "открыть") but leave ALL CAPS alone.
+const lowerFirst = s => /^\p{Lu}\p{Ll}/u.test(s) ? s.charAt(0).toLowerCase() + s.slice(1) : s;
 
 // Google translates single words through English, so 火车 ("train") can come back as
 // "тренироваться". When Google offers several variants, MyMemory picks between them.
 async function translateWord(h) {
   const norm = s => s.toLowerCase().replace(/ё/g, 'е').replace(/[.。!]+$/, '').trim();
-  let g = null, mm = '';
-  try { g = await googleTranslate(h, 'zh-CN'); } catch {}
-  if (!g || g.alts.length > 1) { try { mm = await myMemory(h, 'zh-CN'); } catch {} }
-  if (!g && !mm) throw new Error('offline');
-  let main = g?.main || mm;
-  if (g && mm) main = g.alts.find(a => norm(a) === norm(mm)) || main;
-  // the dictionary capitalises only proper nouns, so "Открыть" → "открыть" but "Пекин" stays
+  let g = null, gErr = null, mm = '';
+  try { g = await googleTranslate(h, 'zh-CN'); } catch (e) { gErr = e; }
+  if (!g || g.alts.length > 1) { try { mm = cleanMyMemory(await myMemory(h)); } catch {} }
+  let main;
+  if (g) main = (mm && g.alts.find(a => norm(a) === norm(mm))) || g.main;
+  else if (mm) main = mm;
+  else throw gErr || new Error('перевод не найден');
+  // the dictionary capitalises only proper nouns, so "Мать" → "мать" but "Пекин" stays
   const e = dictMap && dictMap.get(h);
-  if (e && /^[a-z(]/.test(e.en)) main = main.charAt(0).toLowerCase() + main.slice(1);
-  const alts = (g?.alts || []).filter(a => norm(a) !== norm(main));
-  return { main, alts };
+  if (!e || /^[a-z(]/.test(e.en)) main = lowerFirst(main);
+  const alts = (g?.alts || []).map(a => e && !/^[a-z(]/.test(e.en) ? a : lowerFirst(a)).filter(a => norm(a) !== norm(main));
+  return { main, alts, source: g ? 'google' : 'mymemory' };
 }
 
 /* ---------- speech ---------- */
@@ -404,12 +446,11 @@ function openEditor(deckId, cardId) {
     if (!h) return;
     if (!st.trTouched) { tr.value = ''; tr.placeholder = 'перевожу…'; }
     try {
-      const [res, enRu] = await Promise.all([
-        translateWord(h),
-        entry?.en ? translate(entry.en, 'en').catch(() => '') : Promise.resolve(''),
-      ]);
+      const res = await translateWord(h);
+      const enRu = entry?.en ? await googleTranslate(entry.en, 'en').then(r => r.main, () => '') : '';
       if (my !== st.trToken) return;
       if (!st.trTouched) tr.value = res.main;
+      if (res.source === 'mymemory') toast('Google не ответил — перевод из запасного словаря, проверь его');
       const seen = new Set([res.main.toLowerCase()]);
       const variants = [...res.alts, ...enRu.split(/[;；]\s*/).map(s => s.replace(/\(.*?\)/g, '').trim())]
         .filter(v => v && v.length < 40 && !seen.has(v.toLowerCase()) && seen.add(v.toLowerCase()));
@@ -417,8 +458,8 @@ function openEditor(deckId, cardId) {
         chips.innerHTML = '<div class="chips-hint">Ещё значения — нажми, чтобы добавить:</div>' +
           variants.map(v => `<button class="chip" type="button">${esc(v)}</button>`).join('');
       }
-    } catch {
-      if (my === st.trToken && !st.trTouched) toast('Нет интернета — перевод можно вписать вручную');
+    } catch (err) {
+      if (my === st.trToken && !st.trTouched) toast(`Перевод не загрузился (${err.message}) — впиши вручную или нажми «перевести заново»`);
     } finally {
       if (my === st.trToken) tr.placeholder = '';
     }
@@ -703,13 +744,15 @@ function openBulk(deckId) {
     back.textContent = '‹ Назад';
     body.innerHTML = `
       <p class="en-hint" style="margin-top:0">Перевод подтягивается сам — поправь, если нужно. ✕ убирает слово из списка.</p>
+      <p class="bk-progress" id="bkProgress" aria-live="polite"></p>
       <div class="bk-list">${items.map((it, i) => `
         <div class="bk-row ${it.on ? '' : 'off'}" data-i="${i}">
           <div class="bk-h" lang="zh">${esc(it.hanzi)}</div>
           <div class="bk-f">
             <input class="bk-py" data-f="pinyin" value="${esc(it.pinyin)}" aria-label="Пиньинь" autocomplete="off" autocapitalize="off" spellcheck="false">
-            <input class="bk-tr" data-f="translation" value="${esc(it.translation)}" aria-label="Перевод" placeholder="${it.trTouched ? '' : 'перевожу…'}" autocomplete="off">
+            <input class="bk-tr" data-f="translation" value="${esc(it.translation)}" aria-label="Перевод" placeholder="${it.trTouched ? '' : 'в очереди…'}" autocomplete="off">
             ${it.dup ? '<div class="bk-dup">уже есть в наборе</div>' : ''}
+            <div class="bk-dup bk-note" hidden>запасной переводчик — проверь</div>
           </div>
           <button class="bk-x" data-x="${i}" type="button" aria-label="${it.on ? 'Убрать' : 'Вернуть'}">${it.on ? '✕' : '↺'}</button>
         </div>`).join('')}
@@ -724,26 +767,45 @@ function openBulk(deckId) {
     next.disabled = !n;
   }
 
-  async function translateAll() {
+  // Google requests still go one at a time through its queue; three workers only let
+  // the slower MyMemory lookups overlap. onlyEmpty retries the words that failed.
+  async function translateAll(onlyEmpty = false) {
     const my = ++token;
-    const queue = items.filter(it => !it.trTouched);
-    let failed = 0;
-    loading = true;
+    const queue = items.filter(it => !it.trTouched && (!onlyEmpty || !it.translation || it.src === 'mymemory'));
+    const total = queue.length, progress = $('#bkProgress', ov);
+    let done = 0, failed = 0, fallback = 0, lastErr = '';
+    loading = total > 0;
+    const show = () => { progress.textContent = `Перевожу: ${done} из ${total}…`; };
     const worker = async () => {
       while (queue.length && my === token) {
         const it = queue.shift();
-        let ru = '';
-        try { ru = (await translateWord(it.hanzi)).main; } catch { failed++; }
+        const row = ov.querySelector(`.bk-row[data-i="${items.indexOf(it)}"]`);
+        const inp = row?.querySelector('.bk-tr'), note = row?.querySelector('.bk-note');
+        if (inp) inp.placeholder = 'перевожу…';
+        let res = null;
+        try { res = await translateWord(it.hanzi); } catch (e) { failed++; lastErr = e.message; }
         if (my !== token) return;
-        const inp = ov.querySelector(`.bk-row[data-i="${items.indexOf(it)}"] .bk-tr`);
-        if (!it.trTouched) { it.translation = ru; if (inp) inp.value = ru; }
-        if (inp) inp.placeholder = 'перевод';
+        if (!it.trTouched) { it.translation = res ? res.main : ''; if (inp) inp.value = it.translation; }
+        if (inp) inp.placeholder = res ? 'перевод' : 'не перевелось — впиши сам';
+        it.src = res?.source;
+        if (it.src === 'mymemory') fallback++;
+        if (note) note.hidden = it.src !== 'mymemory';
+        done++;
+        show();
       }
     };
-    await Promise.all([worker(), worker(), worker(), worker()]);
+    show();
+    await Promise.all([worker(), worker(), worker()]);
     if (my !== token) return;
     loading = false;
-    if (failed) toast('Часть переводов не загрузилась — впиши вручную');
+    const problems = [
+      failed ? `не перевелось: ${failed} (${esc(lastErr)})` : '',
+      fallback ? `из запасного переводчика: ${fallback}` : '',
+    ].filter(Boolean).join(', ');
+    progress.innerHTML = problems
+      ? `${problems.charAt(0).toUpperCase() + problems.slice(1)}. <button class="link" id="bkRetry" type="button">↻ Повторить через Google</button>`
+      : '';
+    if (problems) $('#bkRetry', ov).onclick = () => translateAll(true);
   }
 
   body.addEventListener('input', e => {
@@ -767,7 +829,8 @@ function openBulk(deckId) {
   back.onclick = () => step === 1 ? close() : step1();
   next.onclick = () => {
     if (step === 1) return step2();
-    if (loading) return toast('Секунду, ещё перевожу…');
+    if (loading && !confirm('Переводы ещё загружаются. Добавить как есть? Пустые переводы можно будет дописать в карточках.')) return;
+    token++; // stop translating: the list is being saved
     const add = items.filter(it => it.on);
     if (!add.length) return;
     const t = Date.now();

@@ -158,22 +158,49 @@ function cleanMyMemory(s) {
 // Lower-case a capitalised first letter ("Открыть" → "открыть") but leave ALL CAPS alone.
 const lowerFirst = s => /^\p{Lu}\p{Ll}/u.test(s) ? s.charAt(0).toLowerCase() + s.slice(1) : s;
 
+// The dictionary capitalises only proper nouns, so "Мать" → "мать" but "Пекин" stays.
+function fixCase(h, s) {
+  const e = dictMap && dictMap.get(h);
+  return !e || /^[a-z(]/.test(e.en) ? lowerFirst(s) : s;
+}
+
 // Google translates single words through English, so 火车 ("train") can come back as
 // "тренироваться". When Google offers several variants, MyMemory picks between them.
-async function translateWord(h) {
+// skipGoogle: Google is already refusing us, so go straight to MyMemory.
+async function translateWord(h, { skipGoogle = false } = {}) {
   const norm = s => s.toLowerCase().replace(/ё/g, 'е').replace(/[.。!]+$/, '').trim();
   let g = null, gErr = null, mm = '';
-  try { g = await googleTranslate(h, 'zh-CN'); } catch (e) { gErr = e; }
+  if (!skipGoogle) { try { g = await googleTranslate(h, 'zh-CN'); } catch (e) { gErr = e; } }
   if (!g || g.alts.length > 1) { try { mm = cleanMyMemory(await myMemory(h)); } catch {} }
   let main;
   if (g) main = (mm && g.alts.find(a => norm(a) === norm(mm))) || g.main;
   else if (mm) main = mm;
-  else throw gErr || new Error('перевод не найден');
-  // the dictionary capitalises only proper nouns, so "Мать" → "мать" but "Пекин" stays
-  const e = dictMap && dictMap.get(h);
-  if (!e || /^[a-z(]/.test(e.en)) main = lowerFirst(main);
-  const alts = (g?.alts || []).map(a => e && !/^[a-z(]/.test(e.en) ? a : lowerFirst(a)).filter(a => norm(a) !== norm(main));
+  else throw gErr || new Error(skipGoogle ? 'Google не ответил' : 'перевод не найден');
+  main = fixCase(h, main);
+  const alts = (g?.alts || []).map(a => fixCase(h, a)).filter(a => norm(a) !== norm(main));
   return { main, alts, source: g ? 'google' : 'mymemory' };
+}
+
+// Google's free endpoint starts refusing an address after many requests in a row, so a
+// list goes in batches: words joined by newlines in one request, one translated line each.
+const BATCH_CHARS = 1500; // keeps the request URL short
+function makeBatches(words) {
+  const batches = [];
+  let cur = [], len = 0;
+  for (const w of words) {
+    const l = encodeURIComponent(w).length + 3;
+    if (cur.length && len + l > BATCH_CHARS) { batches.push(cur); cur = []; len = 0; }
+    cur.push(w);
+    len += l;
+  }
+  if (cur.length) batches.push(cur);
+  return batches;
+}
+async function googleBatch(words) {
+  const { main } = await googleTranslate(words.join('\n'), 'zh-CN');
+  const lines = main.split('\n').map(s => s.trim().replace(/[.。]+$/, ''));
+  if (lines.length !== words.length) throw new Error('Google перепутал строки');
+  return lines.map((s, i) => s && !HAN.test(s) ? fixCase(words[i], s) : ''); // '' = left untranslated
 }
 
 /* ---------- speech ---------- */
@@ -767,34 +794,54 @@ function openBulk(deckId) {
     next.disabled = !n;
   }
 
-  // Google requests still go one at a time through its queue; three workers only let
-  // the slower MyMemory lookups overlap. onlyEmpty retries the words that failed.
+  // Batches first (a few Google requests for the whole list). Words a batch could not cover
+  // go one by one; once a batch has failed, Google is refusing us, so those skip straight
+  // to MyMemory instead of adding more requests. onlyEmpty retries the words that failed.
   async function translateAll(onlyEmpty = false) {
     const my = ++token;
     const queue = items.filter(it => !it.trTouched && (!onlyEmpty || !it.translation || it.src === 'mymemory'));
     const total = queue.length, progress = $('#bkProgress', ov);
-    let done = 0, failed = 0, fallback = 0, lastErr = '';
+    let done = 0, failed = 0, fallback = 0, lastErr = '', googleDown = false;
     loading = total > 0;
     const show = () => { progress.textContent = `Перевожу: ${done} из ${total}…`; };
-    const worker = async () => {
-      while (queue.length && my === token) {
-        const it = queue.shift();
-        const row = ov.querySelector(`.bk-row[data-i="${items.indexOf(it)}"]`);
-        const inp = row?.querySelector('.bk-tr'), note = row?.querySelector('.bk-note');
-        if (inp) inp.placeholder = 'перевожу…';
-        let res = null;
-        try { res = await translateWord(it.hanzi); } catch (e) { failed++; lastErr = e.message; }
-        if (my !== token) return;
-        if (!it.trTouched) { it.translation = res ? res.main : ''; if (inp) inp.value = it.translation; }
-        if (inp) inp.placeholder = res ? 'перевод' : 'не перевелось — впиши сам';
-        it.src = res?.source;
-        if (it.src === 'mymemory') fallback++;
-        if (note) note.hidden = it.src !== 'mymemory';
-        done++;
-        show();
-      }
+    const rowOf = it => ov.querySelector(`.bk-row[data-i="${items.indexOf(it)}"]`);
+    const apply = (it, res) => {
+      const row = rowOf(it), inp = row?.querySelector('.bk-tr'), note = row?.querySelector('.bk-note');
+      if (!it.trTouched) { it.translation = res ? res.main : ''; if (inp) inp.value = it.translation; }
+      if (inp) inp.placeholder = res ? 'перевод' : 'не перевелось — впиши сам';
+      it.src = res?.source;
+      if (!res) failed++;
+      if (it.src === 'mymemory') fallback++;
+      if (note) note.hidden = it.src !== 'mymemory';
+      done++;
+      show();
     };
     show();
+
+    const rest = [];
+    for (const batch of makeBatches(queue.map(it => it.hanzi))) {
+      if (my !== token) return;
+      const its = batch.map(h => queue.find(it => it.hanzi === h));
+      if (googleDown) { rest.push(...its); continue; }
+      its.forEach(it => { const inp = rowOf(it)?.querySelector('.bk-tr'); if (inp) inp.placeholder = 'перевожу…'; });
+      let lines = null;
+      try { lines = await googleBatch(batch); }
+      catch (e) { lastErr = e.message; googleDown = e.message !== 'Google перепутал строки'; }
+      if (my !== token) return;
+      its.forEach((it, k) => lines && lines[k] ? apply(it, { main: lines[k], source: 'google' }) : rest.push(it));
+    }
+
+    const worker = async () => {
+      while (rest.length && my === token) {
+        const it = rest.shift();
+        const inp = rowOf(it)?.querySelector('.bk-tr');
+        if (inp) inp.placeholder = 'перевожу…';
+        let res = null;
+        try { res = await translateWord(it.hanzi, { skipGoogle: googleDown }); } catch (e) { lastErr = e.message; }
+        if (my !== token) return;
+        apply(it, res);
+      }
+    };
     await Promise.all([worker(), worker(), worker()]);
     if (my !== token) return;
     loading = false;

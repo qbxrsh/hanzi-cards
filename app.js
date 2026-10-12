@@ -100,17 +100,38 @@ function toPinyin(h) {
 }
 
 /* ---------- translation (Google, fallback MyMemory) ---------- */
+async function googleTranslate(text, from) {
+  const r = await fetch('https://translate.googleapis.com/translate_a/single?client=gtx&sl=' + from + '&tl=ru&dt=t&dt=at&q=' + encodeURIComponent(text));
+  if (!r.ok) throw new Error(r.status);
+  const j = await r.json();
+  const alts = Array.isArray(j[5]) && j[5].length === 1 ? (j[5][0][2] || []).map(a => a[0]) : [];
+  return { main: j[0].map(x => x[0]).join('').trim(), alts };
+}
+async function myMemory(text, from) {
+  const r = await fetch('https://api.mymemory.translated.net/get?langpair=' + (from === 'en' ? 'en' : 'zh-CN') + '|ru&q=' + encodeURIComponent(text));
+  const j = await r.json();
+  return (j.responseData?.translatedText || '').trim();
+}
 async function translate(text, from) {
-  try {
-    const r = await fetch('https://translate.googleapis.com/translate_a/single?client=gtx&sl=' + from + '&tl=ru&dt=t&q=' + encodeURIComponent(text));
-    if (!r.ok) throw new Error(r.status);
-    const j = await r.json();
-    return j[0].map(x => x[0]).join('').trim();
-  } catch {
-    const r = await fetch('https://api.mymemory.translated.net/get?langpair=' + (from === 'en' ? 'en' : 'zh-CN') + '|ru&q=' + encodeURIComponent(text));
-    const j = await r.json();
-    return (j.responseData?.translatedText || '').trim();
-  }
+  try { return (await googleTranslate(text, from)).main; }
+  catch { return myMemory(text, from); }
+}
+
+// Google translates single words through English, so 火车 ("train") can come back as
+// "тренироваться". When Google offers several variants, MyMemory picks between them.
+async function translateWord(h) {
+  const norm = s => s.toLowerCase().replace(/ё/g, 'е').replace(/[.。!]+$/, '').trim();
+  let g = null, mm = '';
+  try { g = await googleTranslate(h, 'zh-CN'); } catch {}
+  if (!g || g.alts.length > 1) { try { mm = await myMemory(h, 'zh-CN'); } catch {} }
+  if (!g && !mm) throw new Error('offline');
+  let main = g?.main || mm;
+  if (g && mm) main = g.alts.find(a => norm(a) === norm(mm)) || main;
+  // the dictionary capitalises only proper nouns, so "Открыть" → "открыть" but "Пекин" stays
+  const e = dictMap && dictMap.get(h);
+  if (e && /^[a-z(]/.test(e.en)) main = main.charAt(0).toLowerCase() + main.slice(1);
+  const alts = (g?.alts || []).filter(a => norm(a) !== norm(main));
+  return { main, alts };
 }
 
 /* ---------- speech ---------- */
@@ -264,7 +285,7 @@ function renderDeck(id) {
         <button class="btn primary wide" id="study" ${cs.length ? '' : 'disabled'}>Учить · ${cs.length}</button>
         ${hard.length ? `<button class="btn bad wide" id="studyHard">Повторить трудные · ${hard.length}</button>` : ''}
       </div>
-      <div class="list-head"><h2>Карточки</h2><button class="btn small primary" id="add">+ Добавить</button></div>
+      <div class="list-head"><h2>Карточки</h2><div class="row"><button class="btn small ghost" id="addBulk">Списком</button><button class="btn small primary" id="add">+ Добавить</button></div></div>
       <div class="cards">
         ${cs.length ? cs.map(c => `
           <button class="crow" data-id="${c.id}">
@@ -293,6 +314,7 @@ function renderDeck(id) {
   $('#study').onclick = () => { startStudy(id, cs.map(c => c.id)); location.hash = '#/study/' + id; };
   if (hard.length) $('#studyHard').onclick = () => { startStudy(id, hard.map(c => c.id)); location.hash = '#/study/' + id; };
   $('#add').onclick = () => openEditor(id);
+  $('#addBulk').onclick = () => openBulk(id);
   app.querySelectorAll('.crow').forEach(b => b.onclick = () => openEditor(id, b.dataset.id));
   $('#rename').onclick = () => {
     const name = prompt('Новое название', d.name);
@@ -381,15 +403,15 @@ function openEditor(deckId, cardId) {
     if (!h) return;
     if (!st.trTouched) { tr.value = ''; tr.placeholder = 'перевожу…'; }
     try {
-      const [ru, alts] = await Promise.all([
-        translate(h, 'zh-CN'),
+      const [res, enRu] = await Promise.all([
+        translateWord(h),
         entry?.en ? translate(entry.en, 'en').catch(() => '') : Promise.resolve(''),
       ]);
       if (my !== st.trToken) return;
-      if (!st.trTouched) tr.value = ru;
-      const main = ru.toLowerCase();
-      const variants = [...new Set(alts.split(/[;；]\s*/).map(s => s.replace(/\(.*?\)/g, '').trim()).filter(Boolean))]
-        .filter(v => v.toLowerCase() !== main && v.length < 40);
+      if (!st.trTouched) tr.value = res.main;
+      const seen = new Set([res.main.toLowerCase()]);
+      const variants = [...res.alts, ...enRu.split(/[;；]\s*/).map(s => s.replace(/\(.*?\)/g, '').trim())]
+        .filter(v => v && v.length < 40 && !seen.has(v.toLowerCase()) && seen.add(v.toLowerCase()));
       if (variants.length) {
         chips.innerHTML = '<div class="chips-hint">Ещё значения — нажми, чтобы добавить:</div>' +
           variants.map(v => `<button class="chip" type="button">${esc(v)}</button>`).join('');
@@ -484,6 +506,264 @@ function openEditor(deckId, cardId) {
 
   if (card) loadDict().catch(() => {}).then(() => { $('#edEn', ov).textContent = dictMap?.get(card.hanzi)?.en ? 'EN: ' + dictMap.get(card.hanzi).en : ''; });
   updatePreview();
+}
+
+/* ---------- bulk add ---------- */
+const BULK_MAX = 500;
+const PINYIN_PART = /^([a-zA-ZüÀ-ɏ̀-ͯ\d' ]+?)\s*[-—–:：=,]?\s*([Ѐ-ӿ].*)$/;
+
+// One word per line or separated by spaces/commas. A line "学习 - учиться",
+// "学习 xuéxí учиться" or a table row "学习 | xuéxí | учиться" keeps its own pinyin/translation.
+// Long runs of characters (sentences) are split into words.
+function parseBulk(text, split) {
+  const seg = window.Intl && Intl.Segmenter ? new Intl.Segmenter('zh', { granularity: 'word' }) : null;
+  const words = tok => {
+    const w = hanChars(tok).join('');
+    if (!w) return [];
+    if (w.length <= 4 || !seg) return [w];
+    return [...seg.segment(tok)].filter(s => s.isWordLike).map(s => hanChars(s.segment).join('')).filter(Boolean);
+  };
+  const items = [];
+  for (const raw of text.split(/\r?\n|\r/)) {
+    const line = raw.replace(/^\s*\d+[.)]\s*/, '').replace(/\s*[\t|]\s*/g, ' - ').trim();
+    if (!line) continue;
+    const m = line.match(/^(\S+?)(?:\s*[-—–:：=]\s*|\s+)(.+)$/);
+    if (m && HAN.test(m[1]) && !HAN.test(m[2])) {
+      let rest = m[2].replace(/[()（）[\]]/g, ' ').trim(), pinyin = '';
+      const pm = rest.match(PINYIN_PART);
+      if (pm && pm[1].trim()) { pinyin = pm[1].trim(); rest = pm[2].trim(); }
+      items.push({ hanzi: hanChars(m[1]).join(''), pinyin, translation: rest });
+      continue;
+    }
+    for (const tok of line.split(/[\s,，、;；。.!?！？\/|:：()（）《》“”"'「」-]+/)) {
+      for (const w of words(tok)) items.push({ hanzi: w, pinyin: '', translation: '' });
+    }
+  }
+  const out = split
+    ? items.flatMap(it => hanChars(it.hanzi).length > 1 ? hanChars(it.hanzi).map(c => ({ hanzi: c, pinyin: '', translation: '' })) : [it])
+    : items;
+  const seen = new Set();
+  return out.filter(it => !seen.has(it.hanzi) && seen.add(it.hanzi));
+}
+
+/* ---------- reading .txt / .docx ---------- */
+async function readTextFile(file) {
+  const buf = new Uint8Array(await file.arrayBuffer());
+  if (buf[0] === 0xFF && buf[1] === 0xFE) return new TextDecoder('utf-16le').decode(buf);
+  if (buf[0] === 0xFE && buf[1] === 0xFF) return new TextDecoder('utf-16be').decode(buf);
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(buf); }
+  catch { return new TextDecoder('gbk').decode(buf); } // Chinese Windows "ANSI" files
+}
+
+let jszipPromise = null;
+function loadJSZip() {
+  return jszipPromise ||= new Promise((resolve, reject) => {
+    if (window.JSZip) return resolve(window.JSZip);
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
+    s.onload = () => resolve(window.JSZip);
+    s.onerror = () => { jszipPromise = null; reject(new Error('нет интернета, чтобы открыть .docx')); };
+    document.head.append(s);
+  });
+}
+
+// Paragraphs become lines; table rows become "cell1 | cell2 | …" lines.
+async function readDocx(file) {
+  const JSZip = await loadJSZip();
+  const zip = await JSZip.loadAsync(file);
+  const xml = await zip.file('word/document.xml')?.async('string');
+  if (!xml) throw new Error('это не похоже на .docx');
+  const doc = new DOMParser().parseFromString(xml, 'application/xml');
+  const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+  const paraText = p => {
+    let s = '';
+    const tw = doc.createTreeWalker(p, NodeFilter.SHOW_ELEMENT);
+    for (let n = tw.nextNode(); n; n = tw.nextNode()) {
+      if (n.namespaceURI !== W) continue;
+      if (n.localName === 't') s += n.textContent;
+      else if (n.localName === 'tab') s += '\t';
+      else if (n.localName === 'br' || n.localName === 'cr') s += '\n';
+    }
+    return s;
+  };
+  const lines = [];
+  const walk = el => {
+    for (const ch of el.children) {
+      if (ch.namespaceURI === W && ch.localName === 'p') lines.push(paraText(ch));
+      else if (ch.namespaceURI === W && ch.localName === 'tbl') {
+        for (const tr of ch.getElementsByTagNameNS(W, 'tr')) {
+          const cells = [...tr.children].filter(c => c.localName === 'tc')
+            .map(tc => [...tc.getElementsByTagNameNS(W, 'p')].map(paraText).join(' ').trim())
+            .filter(Boolean);
+          lines.push(cells.join('\t'));
+        }
+      } else walk(ch);
+    }
+  };
+  walk(doc.getElementsByTagNameNS(W, 'body')[0] || doc.documentElement);
+  return lines.join('\n');
+}
+
+async function readWordFile(file) {
+  const name = file.name.toLowerCase();
+  if (name.endsWith('.doc')) throw new Error('старый формат .doc — пересохрани файл как .docx');
+  if (name.endsWith('.pages')) throw new Error('файл Pages — экспортируй его в .docx или .txt');
+  return name.endsWith('.docx') ? readDocx(file) : readTextFile(file);
+}
+
+function openBulk(deckId) {
+  const existing = new Set(cardsOf(deckId).map(c => c.hanzi));
+  const ov = document.createElement('div');
+  ov.className = 'overlay';
+  ov.innerHTML = `
+    <div class="sheet" role="dialog" aria-label="Добавить списком">
+      <div class="sheet-head">
+        <button class="link" id="bkBack">Отмена</button>
+        <b>Добавить списком</b>
+        <button class="link strong" id="bkNext">Дальше</button>
+      </div>
+      <div class="sheet-body" id="bkBody"></div>
+    </div>`;
+  document.body.append(ov);
+  document.body.style.overflow = 'hidden';
+  const body = $('#bkBody', ov), back = $('#bkBack', ov), next = $('#bkNext', ov);
+  let step = 1, text = '', split = false, items = [], token = 0, loading = false;
+
+  const close = () => { token++; ov.remove(); document.body.style.overflow = ''; };
+  ov.addEventListener('click', e => { if (e.target === ov) close(); });
+
+  function step1() {
+    step = 1;
+    token++;
+    back.textContent = 'Отмена';
+    next.textContent = 'Дальше';
+    next.disabled = false;
+    body.innerHTML = `
+      <label class="btn ghost wide file-btn">📄 Загрузить файл · .txt или .docx
+        <input type="file" id="bkFile" hidden accept=".txt,.docx,.csv,.md,.doc,text/plain,text/csv,application/vnd.openxmlformats-officedocument.wordprocessingml.document">
+      </label>
+      <div class="or">или впиши вручную</div>
+      <label class="lbl" for="bkText">Иероглифы или слова</label>
+      <textarea id="bkText" rows="8" lang="zh" placeholder="你好&#10;谢谢 老师 学生&#10;学习 - учиться">${esc(text)}</textarea>
+      <p class="en-hint">Каждое слово с новой строки, через пробел или запятую. Свой перевод можно сразу дописать через тире: <span lang="zh">学习</span> - учиться</p>
+      <label class="check"><input type="checkbox" id="bkSplit" ${split ? 'checked' : ''}> Разбить слова на отдельные иероглифы</label>`;
+    $('#bkFile', ov).onchange = async e => {
+      const file = e.target.files[0];
+      e.target.value = '';
+      if (!file) return;
+      try {
+        const t = await readWordFile(file);
+        if (!HAN.test(t)) throw new Error('в файле не нашлось иероглифов');
+        const ta = $('#bkText', ov);
+        ta.value = (ta.value.trim() ? ta.value.trim() + '\n' : '') + t.trim();
+        toast('Загружено: ' + file.name);
+        step2();
+      } catch (err) {
+        toast('Не получилось: ' + err.message);
+      }
+    };
+  }
+
+  async function step2() {
+    text = $('#bkText', ov).value;
+    split = $('#bkSplit', ov).checked;
+    let parsed = parseBulk(text, split);
+    if (!parsed.length) return toast('Не нашлось иероглифов в тексте');
+    if (parsed.length > BULK_MAX) {
+      toast(`Слов очень много — добавлю первые ${BULK_MAX}`);
+      parsed = parsed.slice(0, BULK_MAX);
+    }
+    step = 2;
+    await loadDict().catch(() => {});
+    items = parsed.map(it => ({
+      ...it,
+      pinyin: it.pinyin || toPinyin(it.hanzi),
+      dup: existing.has(it.hanzi),
+      on: !existing.has(it.hanzi),
+      trTouched: !!it.translation,
+    }));
+    back.textContent = '‹ Назад';
+    body.innerHTML = `
+      <p class="en-hint" style="margin-top:0">Перевод подтягивается сам — поправь, если нужно. ✕ убирает слово из списка.</p>
+      <div class="bk-list">${items.map((it, i) => `
+        <div class="bk-row ${it.on ? '' : 'off'}" data-i="${i}">
+          <div class="bk-h" lang="zh">${esc(it.hanzi)}</div>
+          <div class="bk-f">
+            <input class="bk-py" data-f="pinyin" value="${esc(it.pinyin)}" aria-label="Пиньинь" autocomplete="off" autocapitalize="off" spellcheck="false">
+            <input class="bk-tr" data-f="translation" value="${esc(it.translation)}" aria-label="Перевод" placeholder="${it.trTouched ? '' : 'перевожу…'}" autocomplete="off">
+            ${it.dup ? '<div class="bk-dup">уже есть в наборе</div>' : ''}
+          </div>
+          <button class="bk-x" data-x="${i}" type="button" aria-label="${it.on ? 'Убрать' : 'Вернуть'}">${it.on ? '✕' : '↺'}</button>
+        </div>`).join('')}
+      </div>`;
+    updateCount();
+    translateAll();
+  }
+
+  function updateCount() {
+    const n = items.filter(it => it.on).length;
+    next.textContent = `Добавить · ${n}`;
+    next.disabled = !n;
+  }
+
+  async function translateAll() {
+    const my = ++token;
+    const queue = items.filter(it => !it.trTouched);
+    let failed = 0;
+    loading = true;
+    const worker = async () => {
+      while (queue.length && my === token) {
+        const it = queue.shift();
+        let ru = '';
+        try { ru = (await translateWord(it.hanzi)).main; } catch { failed++; }
+        if (my !== token) return;
+        const inp = ov.querySelector(`.bk-row[data-i="${items.indexOf(it)}"] .bk-tr`);
+        if (!it.trTouched) { it.translation = ru; if (inp) inp.value = ru; }
+        if (inp) inp.placeholder = 'перевод';
+      }
+    };
+    await Promise.all([worker(), worker(), worker(), worker()]);
+    if (my !== token) return;
+    loading = false;
+    if (failed) toast('Часть переводов не загрузилась — впиши вручную');
+  }
+
+  body.addEventListener('input', e => {
+    const row = e.target.closest('.bk-row');
+    if (!row) return;
+    const it = items[+row.dataset.i];
+    it[e.target.dataset.f] = e.target.value;
+    if (e.target.dataset.f === 'translation') it.trTouched = true;
+  });
+  body.addEventListener('click', e => {
+    const x = e.target.closest('[data-x]');
+    if (!x) return;
+    const it = items[+x.dataset.x];
+    it.on = !it.on;
+    x.closest('.bk-row').classList.toggle('off', !it.on);
+    x.textContent = it.on ? '✕' : '↺';
+    x.setAttribute('aria-label', it.on ? 'Убрать' : 'Вернуть');
+    updateCount();
+  });
+
+  back.onclick = () => step === 1 ? close() : step1();
+  next.onclick = () => {
+    if (step === 1) return step2();
+    if (loading) return toast('Секунду, ещё перевожу…');
+    const add = items.filter(it => it.on);
+    if (!add.length) return;
+    const t = Date.now();
+    add.forEach((it, k) => db.cards.push({
+      id: uid(), deckId, created: t + k,
+      hanzi: it.hanzi, pinyin: it.pinyin.trim(), translation: it.translation.trim(), note: '',
+    }));
+    save();
+    close();
+    render();
+    toast(`Добавлено: ${add.length} ${plural(add.length, 'карточка', 'карточки', 'карточек')}`);
+  };
+
+  step1();
 }
 
 /* ---------- writing practice ---------- */

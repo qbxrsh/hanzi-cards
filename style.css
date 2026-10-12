@@ -237,6 +237,23 @@ a { color: inherit; text-decoration: none; }
 .preview .tian { cursor: pointer; }
 .del { margin-top: 26px; }
 
+.link:disabled { opacity: .4; }
+
+/* bulk add */
+.file-btn { cursor: pointer; }
+.or { text-align: center; color: var(--muted); font-size: 13px; margin: 14px 0 -4px; }
+.check { display: flex; align-items: center; gap: 10px; margin-top: 16px; font-size: 15px; cursor: pointer; }
+.sheet .check input { width: 22px; height: 22px; padding: 0; box-shadow: none; accent-color: var(--accent); flex: none; }
+.bk-list { display: grid; gap: 8px; }
+.bk-row { display: flex; align-items: center; gap: 10px; background: var(--surface); border-radius: 14px; padding: 8px 8px 8px 12px; transition: opacity .2s; }
+.bk-row.off { opacity: .4; }
+.bk-h { font-size: 28px; min-width: 48px; text-align: center; line-height: 1.2; }
+.bk-f { flex: 1; min-width: 0; display: grid; gap: 4px; }
+.sheet .bk-f input { padding: 6px 10px; font-size: 16px; border-radius: 10px; }
+.sheet .bk-f .bk-py { color: var(--accent); }
+.bk-dup { font-size: 12px; color: var(--accent); padding-left: 2px; }
+.bk-x { width: 36px; height: 36px; border: 0; border-radius: 50%; background: var(--surface2); cursor: pointer; flex: none; }
+
 /* practice */
 .pr-body { padding: 16px 16px calc(28px + env(safe-area-inset-bottom)); display: grid; justify-items: center; gap: 14px; }
 .pr-nav { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }

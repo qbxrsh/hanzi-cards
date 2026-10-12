@@ -1,0 +1,2 @@
+# hanzi-cards
+learn chinese

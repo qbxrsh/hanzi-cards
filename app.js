@@ -275,6 +275,14 @@ function render() {
   window.scrollTo(0, 0);
 }
 
+// Redraw the current screen after a change (card edited, deleted, added) without
+// jumping to the top of the list.
+function rerender() {
+  const y = window.scrollY;
+  render();
+  window.scrollTo(0, y);
+}
+
 /* ---------- home ---------- */
 function renderHome() {
   app.innerHTML = `
@@ -587,7 +595,7 @@ function openEditor(deckId, cardId) {
     else db.cards.push({ id: uid(), deckId, created: Date.now(), ...data });
     save();
     close();
-    render();
+    rerender();
     if (!card) toast('Карточка добавлена');
   };
   const del = $('#edDel', ov);
@@ -596,7 +604,7 @@ function openEditor(deckId, cardId) {
     db.cards = db.cards.filter(c => c.id !== card.id);
     save();
     close();
-    render();
+    rerender();
   };
 
   if (card && !card.en) loadDict().then(fillEn, () => {});
@@ -914,7 +922,7 @@ function openBulk(deckId) {
     }));
     save();
     close();
-    render();
+    rerender();
     toast(`Добавлено: ${add.length} ${plural(add.length, 'карточка', 'карточки', 'карточек')}`);
   };
 

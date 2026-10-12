@@ -648,7 +648,23 @@ function openBulk(deckId) {
       <label class="lbl" for="bkText">Иероглифы или слова</label>
       <textarea id="bkText" rows="8" lang="zh" placeholder="你好&#10;谢谢 老师 学生&#10;学习 - учиться">${esc(text)}</textarea>
       <p class="en-hint">Каждое слово с новой строки, через пробел или запятую. Свой перевод можно сразу дописать через тире: <span lang="zh">学习</span> - учиться</p>
-      <label class="check"><input type="checkbox" id="bkSplit" ${split ? 'checked' : ''}> Разбить слова на отдельные иероглифы</label>`;
+      <div class="check-row">
+        <label class="check"><input type="checkbox" id="bkSplit" ${split ? 'checked' : ''}> Разбить слова на отдельные иероглифы</label>
+        <button class="help" id="bkSplitQ" type="button" aria-label="Что это значит?" aria-expanded="false" aria-controls="bkSplitHelp">?</button>
+      </div>
+      <div class="help-text" id="bkSplitHelp" hidden>
+        Каждое слово превратится в карточки отдельных иероглифов.<br>
+        Например, <span lang="zh">学习 老师</span>: без галочки будут 2 карточки — <span lang="zh">学习</span> и <span lang="zh">老师</span>,
+        а с галочкой 4 — <span lang="zh">学, 习, 老, 师</span>. Повторы убираются сами.<br>
+        Удобно, чтобы учить, как пишется и что значит каждый иероглиф. Свой перевод слова при этом не сохранится —
+        у каждого иероглифа будет свой автоматический.
+      </div>`;
+    $('#bkSplitQ', ov).onclick = e => {
+      const help = $('#bkSplitHelp', ov);
+      help.hidden = !help.hidden;
+      e.currentTarget.setAttribute('aria-expanded', String(!help.hidden));
+      e.currentTarget.classList.toggle('on', !help.hidden);
+    };
     $('#bkFile', ov).onchange = async e => {
       const file = e.target.files[0];
       e.target.value = '';

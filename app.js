@@ -93,6 +93,14 @@ function searchDict(q) {
   return [...exact, ...start, ...en].slice(0, 50);
 }
 
+// English from the built-in dictionary (CC-CEDICT via the HSK list): instant and offline.
+// dict.txt cuts glosses at 80 characters, so drop a meaning that was cut in half.
+function dictEn(h) {
+  const en = dictMap && dictMap.get(h)?.en;
+  if (!en) return '';
+  return en.length >= 80 && en.includes(';') ? en.slice(0, en.lastIndexOf(';')) : en;
+}
+
 function toPinyin(h) {
   const e = dictMap && dictMap.get(h);
   if (e) return e.py;
@@ -363,7 +371,7 @@ function renderDeck(id) {
             <span class="crow-h" lang="zh">${esc(c.hanzi)}</span>
             <span class="crow-t">
               <div class="crow-p">${esc(c.pinyin)}</div>
-              <div class="crow-tr">${esc(c.translation)}</div>
+              <div class="crow-tr">${esc(c.translation || c.en)}</div>
             </span>
             ${c.last === 'bad' ? '<span class="tag">трудная</span>' : ''}
           </button>`).join('')
@@ -429,10 +437,11 @@ function openEditor(deckId, cardId) {
         <input id="edHanzi" class="big" lang="zh" autocomplete="off" value="${esc(card?.hanzi)}">
         <label class="lbl" for="edPinyin">Пиньинь</label>
         <input id="edPinyin" autocomplete="off" autocapitalize="off" spellcheck="false" value="${esc(card?.pinyin)}">
-        <label class="lbl" for="edTr">Перевод <button class="link" id="edRetr" type="button">↻ перевести заново</button></label>
+        <label class="lbl" for="edTr">Перевод на русский <button class="link" id="edRetr" type="button">↻ перевести заново</button></label>
         <textarea id="edTr" rows="2">${esc(card?.translation)}</textarea>
         <div class="chips" id="edChips"></div>
-        <div class="en-hint" id="edEn"></div>
+        <label class="lbl" for="edEn">Перевод на английский <span class="lbl-note">из словаря</span></label>
+        <input id="edEn" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="нет в словаре — можно вписать" value="${esc(card?.en)}">
         <label class="lbl" for="edNote">Заметка</label>
         <textarea id="edNote" rows="2" placeholder="пример, ассоциация, что угодно">${esc(card?.note)}</textarea>
         <label class="lbl">Как писать <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">нажми на иероглиф</span></label>
@@ -448,7 +457,9 @@ function openEditor(deckId, cardId) {
   document.body.append(ov);
   document.body.style.overflow = 'hidden';
 
-  const hz = $('#edHanzi', ov), py = $('#edPinyin', ov), tr = $('#edTr', ov), note = $('#edNote', ov);
+  const hz = $('#edHanzi', ov), py = $('#edPinyin', ov), tr = $('#edTr', ov), enIn = $('#edEn', ov), note = $('#edNote', ov);
+  st.enTouched = !!card?.en;
+  const fillEn = () => { if (!st.enTouched) enIn.value = dictEn(hz.value.trim()); };
   const close = () => { animToken++; ov.remove(); document.body.style.overflow = ''; };
   ov.addEventListener('click', e => { if (e.target === ov || e.target.closest('[data-close]')) close(); });
 
@@ -468,10 +479,9 @@ function openEditor(deckId, cardId) {
   async function autoTranslate() {
     const h = hz.value.trim();
     const my = ++st.trToken;
-    const chips = $('#edChips', ov), enEl = $('#edEn', ov);
+    const chips = $('#edChips', ov);
     chips.innerHTML = '';
     const entry = dictMap && dictMap.get(h);
-    enEl.textContent = entry?.en ? 'EN: ' + entry.en : '';
     if (!h) return;
     if (!st.trTouched) { tr.value = ''; tr.placeholder = 'перевожу…'; }
     try {
@@ -517,11 +527,13 @@ function openEditor(deckId, cardId) {
     clearTimeout(hzTimer);
     hzTimer = setTimeout(() => {
       if (!st.pyTouched) py.value = toPinyin(hz.value.trim());
+      fillEn();
       updatePreview();
       if (!st.trTouched) autoTranslate();
     }, 300);
   });
   py.addEventListener('input', () => { st.pyTouched = true; });
+  enIn.addEventListener('input', () => { st.enTouched = true; });
   tr.addEventListener('input', () => { st.trTouched = true; });
   $('#edRetr', ov).onclick = () => { st.trTouched = false; autoTranslate(); };
   $('#edAnim', ov).onclick = () => animateAll(st.writers);
@@ -554,6 +566,8 @@ function openEditor(deckId, cardId) {
       py.value = en.py;
       st.pyTouched = false;
       st.trTouched = false;
+      st.enTouched = false;
+      fillEn();
       search.value = '';
       sugg.innerHTML = '';
       search.blur();
@@ -568,7 +582,7 @@ function openEditor(deckId, cardId) {
   $('#edSave', ov).onclick = () => {
     const h = hz.value.trim();
     if (!h) { toast('Впиши иероглиф'); hz.focus(); return; }
-    const data = { hanzi: h, pinyin: py.value.trim(), translation: tr.value.trim(), note: note.value.trim() };
+    const data = { hanzi: h, pinyin: py.value.trim(), translation: tr.value.trim(), en: enIn.value.trim(), note: note.value.trim() };
     if (card) Object.assign(card, data);
     else db.cards.push({ id: uid(), deckId, created: Date.now(), ...data });
     save();
@@ -585,7 +599,7 @@ function openEditor(deckId, cardId) {
     render();
   };
 
-  if (card) loadDict().catch(() => {}).then(() => { $('#edEn', ov).textContent = dictMap?.get(card.hanzi)?.en ? 'EN: ' + dictMap.get(card.hanzi).en : ''; });
+  if (card && !card.en) loadDict().then(fillEn, () => {});
   updatePreview();
 }
 
@@ -775,6 +789,7 @@ function openBulk(deckId) {
     items = parsed.map(it => ({
       ...it,
       pinyin: it.pinyin || toPinyin(it.hanzi),
+      en: dictEn(it.hanzi),
       dup: existing.has(it.hanzi),
       on: !existing.has(it.hanzi),
       trTouched: !!it.translation,
@@ -788,7 +803,8 @@ function openBulk(deckId) {
           <div class="bk-h" lang="zh">${esc(it.hanzi)}</div>
           <div class="bk-f">
             <input class="bk-py" data-f="pinyin" value="${esc(it.pinyin)}" aria-label="Пиньинь" autocomplete="off" autocapitalize="off" spellcheck="false">
-            <input class="bk-tr" data-f="translation" value="${esc(it.translation)}" aria-label="Перевод" placeholder="${it.trTouched ? '' : 'в очереди…'}" autocomplete="off">
+            <input class="bk-tr" data-f="translation" value="${esc(it.translation)}" aria-label="Перевод на русский" placeholder="${it.trTouched ? '' : 'в очереди…'}" autocomplete="off">
+            ${it.en ? `<div class="bk-en">EN: ${esc(it.en)}</div>` : ''}
             ${it.dup ? '<div class="bk-dup">уже есть в наборе</div>' : ''}
             <div class="bk-dup bk-note" hidden>запасной переводчик — проверь</div>
           </div>
@@ -894,7 +910,7 @@ function openBulk(deckId) {
     const t = Date.now();
     add.forEach((it, k) => db.cards.push({
       id: uid(), deckId, created: t + k,
-      hanzi: it.hanzi, pinyin: it.pinyin.trim(), translation: it.translation.trim(), note: '',
+      hanzi: it.hanzi, pinyin: it.pinyin.trim(), translation: it.translation.trim(), en: it.en, note: '',
     }));
     save();
     close();
@@ -995,7 +1011,7 @@ function showCard() {
   if (!c) { S.queue.shift(); S.total--; return showCard(); }
 
   const front = prefs.front === 'tr'
-    ? `<div class="front-tr">${esc(c.translation || '—')}</div>`
+    ? `<div class="front-tr">${esc(c.translation || c.en || '—')}</div>`
     : `<div class="front-h" lang="zh">${esc(c.hanzi)}</div>`;
   main.innerHTML = `
     <div class="stage"><div class="card3d" id="card">
@@ -1009,6 +1025,7 @@ function showCard() {
         </div>
         <div class="b-py">${esc(c.pinyin)}</div>
         <div class="b-tr">${esc(c.translation)}</div>
+        ${c.en ? `<div class="b-en">${esc(c.en)}</div>` : ''}
         ${c.note ? `<div class="b-note">${esc(c.note)}</div>` : ''}
       </div>
     </div></div>
@@ -1076,6 +1093,13 @@ function showDone(main) {
 /* ---------- start ---------- */
 load();
 render();
+// cards made before the English field existed get it from the dictionary once
+if (db.cards.some(c => c.en === undefined)) {
+  loadDict().then(() => {
+    db.cards.forEach(c => { if (c.en === undefined) c.en = dictEn(c.hanzi); });
+    save();
+  }, () => {});
+}
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
   navigator.serviceWorker.register('sw.js').catch(() => {});

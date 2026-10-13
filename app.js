@@ -355,6 +355,19 @@ async function importData(file) {
 }
 
 /* ---------- deck ---------- */
+const deckQuery = {}; // search text per deck, kept while the list is redrawn after an edit
+
+// A card matches by characters, by pinyin without tones ("hao" finds 你好)
+// or by a piece of its Russian or English translation.
+function cardMatches(c, q) {
+  q = q.trim().toLowerCase().replace(/ё/g, 'е');
+  if (!q) return true;
+  if (HAN.test(q)) return c.hanzi.includes(q);
+  const k = pyKey(q);
+  if (k && pyKey(c.pinyin || '').includes(k)) return true;
+  return [c.translation, c.en].some(t => (t || '').toLowerCase().replace(/ё/g, 'е').includes(q));
+}
+
 function renderDeck(id) {
   const d = deckById(id), cs = cardsOf(id);
   const hard = cs.filter(c => c.last === 'bad');
@@ -373,6 +386,12 @@ function renderDeck(id) {
         ${hard.length ? `<button class="btn bad wide" id="studyHard">Повторить трудные · ${hard.length}</button>` : ''}
       </div>
       <div class="list-head"><h2>Карточки</h2><div class="row"><button class="btn small ghost" id="addBulk">Списком</button><button class="btn small primary" id="add">+ Добавить</button></div></div>
+      ${cs.length ? `
+      <div class="search deck-search">
+        <input id="deckSearch" class="field" type="search" placeholder="Найти: 字, pinyin или перевод" value="${esc(deckQuery[id] || '')}"
+          autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="Поиск по карточкам">
+      </div>
+      <div class="empty" id="noFound" hidden>Ничего не нашлось</div>` : ''}
       <div class="cards">
         ${cs.length ? cs.map(c => `
           <button class="crow" data-id="${c.id}">
@@ -403,6 +422,22 @@ function renderDeck(id) {
   $('#add').onclick = () => openEditor(id);
   $('#addBulk').onclick = () => openBulk(id);
   app.querySelectorAll('.crow').forEach(b => b.onclick = () => openEditor(id, b.dataset.id));
+
+  const search = $('#deckSearch');
+  if (search) {
+    const filter = () => {
+      deckQuery[id] = search.value;
+      let shown = 0;
+      app.querySelectorAll('.crow').forEach(row => {
+        const ok = cardMatches(db.cards.find(c => c.id === row.dataset.id), search.value);
+        row.hidden = !ok;
+        shown += ok;
+      });
+      $('#noFound').hidden = shown > 0;
+    };
+    search.addEventListener('input', filter);
+    if (search.value) filter();
+  }
   $('#rename').onclick = () => {
     const name = prompt('Новое название', d.name);
     if (!name || !name.trim()) return;
@@ -1072,8 +1107,11 @@ function showCard() {
     if (ok) { S.queue.shift(); S.done++; }
     else {
       S.wrong.add(c.id);
+      // show it again 10–15 cards later (or at the end of a shorter queue): far enough
+      // that she has to recall it rather than remember the answer from a moment ago
       const id = S.queue.shift();
-      S.queue.splice(Math.min(3, S.queue.length), 0, id); // show it again a bit later
+      const gap = 10 + Math.floor(Math.random() * 6);
+      S.queue.splice(Math.min(gap, S.queue.length), 0, id);
     }
     showCard();
   };

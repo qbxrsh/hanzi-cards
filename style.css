@@ -110,6 +110,10 @@ a { color: inherit; text-decoration: none; }
 .list-head { display: flex; align-items: center; justify-content: space-between; margin: 26px 2px 8px; }
 .list-head h2 { margin: 0; font-size: 18px; }
 .cards { display: grid; gap: 8px; }
+.crow[hidden] { display: none; }
+.deck-search { margin-bottom: 10px; }
+.field[type=search] { -webkit-appearance: none; appearance: none; }
+.empty[hidden] { display: none; }
 .crow {
   display: flex; align-items: center; gap: 14px; width: 100%; text-align: left;
   background: var(--surface); border: 0; border-radius: 16px; padding: 12px 14px; cursor: pointer;

@@ -29,7 +29,23 @@ let db;
 
 function load() {
   try { db = JSON.parse(localStorage.getItem(KEY)); } catch { db = null; }
-  if (!db || !Array.isArray(db.decks) || !Array.isArray(db.cards)) { db = seed(); save(); }
+  if (!db || !Array.isArray(db.decks) || !Array.isArray(db.cards)) db = seed();
+  migrate();
+  save();
+}
+
+// Brings data saved by older versions up to the current shape.
+function migrate() {
+  if (!Array.isArray(db.topics)) db.topics = DEFAULT_TOPICS.slice();
+  if (!Array.isArray(db.texts)) db.texts = [];
+  for (const c of db.cards) {
+    if (c.last === undefined) continue;
+    // before the answer history existed only the last answer was kept;
+    // cards shown as "трудная" then stay marked
+    if (!Array.isArray(c.history)) c.history = [c.last];
+    if (c.last === 'bad') c.hardMark = true;
+    delete c.last;
+  }
 }
 function save() {
   try { localStorage.setItem(KEY, JSON.stringify(db)); }
@@ -51,6 +67,91 @@ function savePrefs() { try { localStorage.setItem('hanzi-prefs', JSON.stringify(
 
 const deckById = id => db.decks.find(d => d.id === id);
 const cardsOf = id => db.cards.filter(c => c.deckId === id).sort((a, b) => a.created - b.created);
+
+/* ---------- hard cards ---------- */
+// A card is hard when it was forgotten at least HARD_MISSES times in its last HARD_WINDOW
+// answers, or when marked by hand. Unmarking also clears the answer history, so an old
+// streak of mistakes doesn't mark it again right away.
+const HARD_WINDOW = 5, HARD_MISSES = 2;
+const recentMisses = c => (c.history || []).slice(-HARD_WINDOW).filter(r => r === 'bad').length;
+const autoHard = c => recentMisses(c) >= HARD_MISSES;
+const isHard = c => !!c.hardMark || autoHard(c);
+function setHard(c, on) {
+  if (on) c.hardMark = true;
+  else { delete c.hardMark; c.history = []; }
+}
+function recordAnswer(c, ok) {
+  c.history = [...(c.history || []), ok ? 'ok' : 'bad'].slice(-20);
+}
+function hardReason(c) {
+  if (c.hardMark) return 'отмечена вручную';
+  if (autoHard(c)) return `${recentMisses(c)} раза «Не помню» в последних ${HARD_WINDOW} ответах`;
+  return '';
+}
+const HARD_HELP = `<b>Когда карточка становится трудной.</b> Сама — если в последних ${HARD_WINDOW} ответах
+  в учёбе было ${HARD_MISSES} или больше «Не помню». Когда ошибок в последних ${HARD_WINDOW} ответах станет меньше,
+  метка снимется сама. Ещё карточку можно отметить трудной вручную — такая метка сама не снимается.<br>
+  <b>Снять метку</b> — она исчезнет, а счёт ответов начнётся заново.<br>
+  <b>Зачем.</b> Трудные видно в списке, и их можно учить отдельно: «Учить» → «Трудные».`;
+
+/* ---------- topics (one list shared by all decks) ---------- */
+const DEFAULT_TOPICS = ['еда', 'семья', 'время', 'покупки', 'транспорт', 'погода', 'учёба', 'работа', 'дом',
+  'тело и здоровье', 'город и места', 'хобби', 'чувства', 'числа', 'служебные слова'];
+const normTopic = t => String(t || '').trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 30);
+// Adds topics to the shared list and returns them normalised.
+function addTopics(list) {
+  const out = [...new Set(list.map(normTopic).filter(Boolean))];
+  for (const t of out) if (!db.topics.includes(t)) db.topics.push(t);
+  return out;
+}
+// [[topic, number of cards]] for topics used by these cards, in the shared list's order.
+function topicCounts(cards) {
+  const m = new Map();
+  cards.forEach(c => (c.topics || []).forEach(t => m.set(t, (m.get(t) || 0) + 1)));
+  return db.topics.filter(t => m.has(t)).map(t => [t, m.get(t)]);
+}
+
+/* ---------- sheets and "?" help ---------- */
+// A bottom sheet: "Закрыть" on the left, a title, an optional action on the right.
+function openSheet(titleHtml) {
+  const ov = document.createElement('div');
+  ov.className = 'overlay';
+  ov.innerHTML = `
+    <div class="sheet" role="dialog">
+      <div class="sheet-head"><button class="link" type="button" data-close>Закрыть</button><b>${titleHtml}</b><span class="sheet-right"></span></div>
+      <div class="sheet-body"></div>
+    </div>`;
+  document.body.append(ov);
+  document.body.style.overflow = 'hidden';
+  const close = () => { ov.remove(); if (!document.querySelector('.overlay')) document.body.style.overflow = ''; };
+  ov.addEventListener('click', e => { if (e.target === ov || e.target.closest('[data-close]')) close(); });
+  const setRight = (label, fn) => {
+    const right = $('.sheet-right', ov);
+    right.innerHTML = label ? `<button class="link strong" type="button">${esc(label)}</button>` : '';
+    if (label) right.firstChild.onclick = fn;
+  };
+  return { ov, body: $('.sheet-body', ov), close, setRight };
+}
+
+// A "?" button and its hidden explanation; the one document-level handler below toggles all of them.
+let helpSeq = 0;
+function helpParts(html) {
+  const id = 'help' + ++helpSeq;
+  return {
+    btn: `<button class="help" type="button" data-help="${id}" aria-controls="${id}" aria-expanded="false" aria-label="Что это значит?">?</button>`,
+    box: `<div class="help-text" id="${id}" hidden>${html}</div>`,
+  };
+}
+document.addEventListener('click', e => {
+  const q = e.target.closest('[data-help]');
+  if (!q) return;
+  e.preventDefault();
+  const box = document.getElementById(q.dataset.help);
+  if (!box) return;
+  box.hidden = !box.hidden;
+  q.classList.toggle('on', !box.hidden);
+  q.setAttribute('aria-expanded', String(!box.hidden));
+});
 
 /* ---------- dictionary (HSK 1–9 words, sorted by frequency) ---------- */
 let DICT = null, dictMap = null, dictPromise = null;
@@ -321,7 +422,10 @@ function renderHome() {
 }
 
 async function exportData() {
-  const json = JSON.stringify({ app: 'hanzi-cards', version: 1, exported: new Date().toISOString(), decks: db.decks, cards: db.cards }, null, 1);
+  const json = JSON.stringify({
+    app: 'hanzi-cards', version: 2, exported: new Date().toISOString(),
+    decks: db.decks, cards: db.cards, topics: db.topics, texts: db.texts,
+  }, null, 1);
   const name = `hanzi-cards-${new Date().toISOString().slice(0, 10)}.json`;
   const file = new File([json], name, { type: 'application/json' });
   if (navigator.canShare && navigator.canShare({ files: [file] })) {
@@ -344,18 +448,28 @@ async function importData(file) {
     const deckIds = new Set(db.decks.map(d => d.id)), cardIds = new Set(db.cards.map(c => c.id));
     const newDecks = data.decks.filter(d => d && d.id && !deckIds.has(d.id));
     const newCards = data.cards.filter(c => c && c.id && c.hanzi && !cardIds.has(c.id));
+    const textIds = new Set(db.texts.map(t => t.id));
+    const newTexts = (Array.isArray(data.texts) ? data.texts : []).filter(t => t && t.id && Array.isArray(t.paragraphs) && !textIds.has(t.id));
     db.decks.push(...newDecks);
     db.cards.push(...newCards);
+    db.texts.push(...newTexts);
+    addTopics(Array.isArray(data.topics) ? data.topics : []);
+    migrate(); // cards from an older backup may still have the old fields
     save();
     render();
-    toast(`Добавлено: ${newCards.length} ${plural(newCards.length, 'карточка', 'карточки', 'карточек')}`);
+    toast(`Добавлено: ${newCards.length} ${plural(newCards.length, 'карточка', 'карточки', 'карточек')}`
+      + (newTexts.length ? `, ${newTexts.length} ${plural(newTexts.length, 'текст', 'текста', 'текстов')}` : ''));
   } catch (e) {
     toast('Не получилось прочитать файл: ' + e.message);
   }
 }
 
 /* ---------- deck ---------- */
-const deckQuery = {}; // search text per deck, kept while the list is redrawn after an edit
+// Per deck: search text, topic filter and the set of picked cards (null = not picking).
+// Kept while the list is redrawn after an edit.
+const deckView = {};
+const deckState = id => (deckView[id] ||= { q: '', topic: '', sel: null });
+const NO_TOPIC = '\u0000none';
 
 // A card matches by characters, by pinyin without tones ("hao" finds 你好)
 // or by a piece of its Russian or English translation.
@@ -369,12 +483,18 @@ function cardMatches(c, q) {
 }
 
 function renderDeck(id) {
-  const d = deckById(id), cs = cardsOf(id);
-  const hard = cs.filter(c => c.last === 'bad');
+  const d = deckById(id), cs = cardsOf(id), v = deckState(id);
+  const hardCount = cs.filter(isHard).length;
   const front = prefs.front || 'hanzi';
+  const topics = topicCounts(cs);
+  const noTopic = cs.filter(c => !(c.topics || []).length);
+  const texts = db.texts.filter(t => t.deckId === id).sort((a, b) => b.created - a.created);
+  if (v.topic && v.topic !== NO_TOPIC && !topics.some(([t]) => t === v.topic)) v.topic = '';
+  const picking = !!v.sel;
+  const help = helpParts(HARD_HELP);
   app.innerHTML = `
     <header class="top"><div class="top-in"><a class="nav-back" href="#/">‹ Наборы</a></div></header>
-    <main class="wrap">
+    <main class="wrap ${picking ? 'picking' : ''}">
       <div class="deck-title">${esc(d.name)}</div>
       <div class="study-box">
         <div class="seg-label">Сначала показывать</div>
@@ -382,33 +502,57 @@ function renderDeck(id) {
           <button data-v="hanzi" class="${front === 'hanzi' ? 'on' : ''}">Иероглиф</button>
           <button data-v="tr" class="${front === 'tr' ? 'on' : ''}">Перевод</button>
         </div>
-        <button class="btn primary wide" id="study" ${cs.length ? '' : 'disabled'}>Учить · ${cs.length}</button>
-        ${hard.length ? `<button class="btn bad wide" id="studyHard">Повторить трудные · ${hard.length}</button>` : ''}
+        <button class="btn primary wide" id="study" ${cs.length ? '' : 'disabled'}>Учить…</button>
+        ${hardCount ? `<div class="hard-note"><span class="tag">трудных: ${hardCount}</span>${help.btn}</div>${help.box}` : ''}
       </div>
       <div class="list-head"><h2>Карточки</h2><div class="row"><button class="btn small ghost" id="addBulk">Списком</button><button class="btn small primary" id="add">+ Добавить</button></div></div>
       ${cs.length ? `
       <div class="search deck-search">
-        <input id="deckSearch" class="field" type="search" placeholder="Найти: 字, pinyin или перевод" value="${esc(deckQuery[id] || '')}"
+        <input id="deckSearch" class="field" type="search" placeholder="Найти: 字, pinyin или перевод" value="${esc(v.q)}"
           autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="Поиск по карточкам">
+      </div>
+      ${topics.length ? `
+      <div class="chips topic-filter" id="topicFilter">
+        <button class="chip ${v.topic ? '' : 'on'}" data-topic="" type="button">все · ${cs.length}</button>
+        ${topics.map(([t, n]) => `<button class="chip ${v.topic === t ? 'on' : ''}" data-topic="${esc(t)}" type="button">${esc(t)} · ${n}</button>`).join('')}
+        ${noTopic.length ? `<button class="chip ${v.topic === NO_TOPIC ? 'on' : ''}" data-topic="${NO_TOPIC}" type="button">без темы · ${noTopic.length}</button>` : ''}
+      </div>` : ''}
+      <div class="list-tools">
+        <button class="link" id="pickBtn" type="button">${picking ? 'Отменить выбор' : '☑︎ Выбрать карточки'}</button>
+        ${noTopic.length ? `<button class="link" id="autoTopics" type="button">✨ Темы для ${noTopic.length} без темы</button>` : ''}
       </div>
       <div class="empty" id="noFound" hidden>Ничего не нашлось</div>` : ''}
       <div class="cards">
         ${cs.length ? cs.map(c => `
-          <button class="crow" data-id="${c.id}">
+          <button class="crow ${isHard(c) ? 'hard' : ''} ${v.sel?.has(c.id) ? 'picked' : ''}" data-id="${c.id}" ${picking ? `aria-pressed="${!!v.sel.has(c.id)}"` : ''}>
+            ${picking ? '<span class="crow-check" aria-hidden="true"></span>' : ''}
             <span class="crow-h" lang="zh">${esc(c.hanzi)}</span>
             <span class="crow-t">
               <div class="crow-p">${esc(c.pinyin)}</div>
               <div class="crow-tr">${esc(c.translation || c.en)}</div>
+              ${(c.topics || []).length ? `<div class="crow-topics">${esc(c.topics.join(' · '))}</div>` : ''}
             </span>
-            ${c.last === 'bad' ? '<span class="tag">трудная</span>' : ''}
+            ${isHard(c) ? '<span class="tag">трудная</span>' : ''}
           </button>`).join('')
         : `<div class="empty"><span class="big" lang="zh">字</span>Пока пусто. Нажми «Добавить», чтобы создать первую карточку.</div>`}
       </div>
+      ${texts.length ? `
+      <div class="list-head"><h2>Тексты</h2></div>
+      <div class="cards">${texts.map(t => `
+        <button class="trow" data-text="${t.id}">
+          <b>${esc(t.title)}</b>
+          <span class="muted" lang="zh">${esc(t.words.join(' '))}</span>
+        </button>`).join('')}</div>` : ''}
       <div class="deck-foot">
         <button class="link" id="rename">Переименовать</button>
         <button class="link" id="delDeck">Удалить набор</button>
       </div>
-    </main>`;
+    </main>
+    ${picking ? `
+    <div class="pickbar"><div class="pickbar-in">
+      <div class="pickbar-top"><span id="pickCount"></span><button class="link" id="pickVisible" type="button">выбрать все видимые</button></div>
+      <div class="row"><button class="btn primary" id="pickStudy" type="button">Учить</button><button class="btn" id="pickText" type="button">✨ Составить текст</button></div>
+    </div></div>` : ''}`;
 
   $('#seg').onclick = e => {
     const b = e.target.closest('button');
@@ -417,26 +561,81 @@ function renderDeck(id) {
     savePrefs();
     [...$('#seg').children].forEach(x => x.classList.toggle('on', x === b));
   };
-  $('#study').onclick = () => { startStudy(id, cs.map(c => c.id)); location.hash = '#/study/' + id; };
-  if (hard.length) $('#studyHard').onclick = () => { startStudy(id, hard.map(c => c.id)); location.hash = '#/study/' + id; };
+  $('#study').onclick = () => openStudyLauncher(id);
   $('#add').onclick = () => openEditor(id);
   $('#addBulk').onclick = () => openBulk(id);
-  app.querySelectorAll('.crow').forEach(b => b.onclick = () => openEditor(id, b.dataset.id));
+  app.querySelectorAll('[data-text]').forEach(b => b.onclick = () => {
+    const t = db.texts.find(x => x.id === b.dataset.text);
+    if (t) openTextViewer(t);
+  });
 
+  const visibleRows = () => [...app.querySelectorAll('.crow')].filter(r => !r.hidden);
+  const updatePickCount = () => {
+    const n = v.sel.size;
+    $('#pickCount').textContent = `Выбрано: ${n}`;
+    $('#pickStudy').disabled = $('#pickText').disabled = !n;
+  };
+  app.querySelectorAll('.crow').forEach(row => row.onclick = () => {
+    if (!v.sel) return openEditor(id, row.dataset.id);
+    const on = !v.sel.has(row.dataset.id);
+    if (on) v.sel.add(row.dataset.id); else v.sel.delete(row.dataset.id);
+    row.classList.toggle('picked', on);
+    row.setAttribute('aria-pressed', String(on));
+    updatePickCount();
+  });
+  if (cs.length) {
+    $('#pickBtn').onclick = () => { v.sel = v.sel ? null : new Set(); rerender(); };
+    if (picking) {
+      updatePickCount();
+      $('#pickVisible').onclick = () => {
+        visibleRows().forEach(r => { v.sel.add(r.dataset.id); r.classList.add('picked'); r.setAttribute('aria-pressed', 'true'); });
+        updatePickCount();
+      };
+      const picked = () => cs.filter(c => v.sel.has(c.id));
+      $('#pickStudy').onclick = () => { const ids = picked().map(c => c.id); v.sel = null; startStudy(id, ids); location.hash = '#/study/' + id; };
+      $('#pickText').onclick = () => openTextMaker(id, picked());
+    }
+  }
+
+  const autoBtn = $('#autoTopics');
+  if (autoBtn) autoBtn.onclick = async () => {
+    autoBtn.disabled = true;
+    autoBtn.textContent = '✨ Определяю темы…';
+    try {
+      const map = await aiTopics(noTopic.map(c => ({ hanzi: c.hanzi, translation: c.translation || c.en })));
+      let n = 0;
+      noTopic.forEach(c => { const t = map.get(c.hanzi); if (t && t.length) { c.topics = t; n++; } });
+      save();
+      toast(`Темы определены для ${n} ${plural(n, 'карточки', 'карточек', 'карточек')}`);
+    } catch (err) {
+      toast('Не получилось определить темы: ' + err.message);
+    }
+    rerender();
+  };
+
+  // search and topic filter work together; picked cards stay picked while filtering
   const search = $('#deckSearch');
+  const filter = () => {
+    let shown = 0;
+    app.querySelectorAll('.crow').forEach(row => {
+      const c = db.cards.find(x => x.id === row.dataset.id);
+      const t = c.topics || [];
+      const ok = cardMatches(c, v.q) && (!v.topic || (v.topic === NO_TOPIC ? !t.length : t.includes(v.topic)));
+      row.hidden = !ok;
+      shown += ok;
+    });
+    $('#noFound').hidden = shown > 0;
+  };
   if (search) {
-    const filter = () => {
-      deckQuery[id] = search.value;
-      let shown = 0;
-      app.querySelectorAll('.crow').forEach(row => {
-        const ok = cardMatches(db.cards.find(c => c.id === row.dataset.id), search.value);
-        row.hidden = !ok;
-        shown += ok;
-      });
-      $('#noFound').hidden = shown > 0;
-    };
-    search.addEventListener('input', filter);
-    if (search.value) filter();
+    search.addEventListener('input', () => { v.q = search.value; filter(); });
+    $('#topicFilter')?.addEventListener('click', e => {
+      const b = e.target.closest('[data-topic]');
+      if (!b) return;
+      v.topic = b.dataset.topic;
+      $('#topicFilter').querySelectorAll('.chip').forEach(x => x.classList.toggle('on', x === b));
+      filter();
+    });
+    if (v.q || v.topic) filter();
   }
   $('#rename').onclick = () => {
     const name = prompt('Новое название', d.name);
@@ -454,10 +653,59 @@ function renderDeck(id) {
   };
 }
 
+/* ---------- what to study ---------- */
+function openStudyLauncher(id) {
+  const cs = cardsOf(id), hard = cs.filter(isHard), topics = topicCounts(cs);
+  const { body, close } = openSheet('Что учить?');
+  const help = helpParts(HARD_HELP);
+  const sizes = [10, 20, 30].filter(n => n < cs.length);
+  body.innerHTML = `
+    <button class="btn primary wide" data-go="all" type="button">Все карточки · ${cs.length}</button>
+    <div class="launch-row">
+      <button class="btn bad wide" data-go="hard" type="button" ${hard.length ? '' : 'disabled'}>Трудные · ${hard.length}</button>${help.btn}
+    </div>${help.box}
+    <div class="lbl">Случайные</div>
+    <div class="chips">
+      ${sizes.map(n => `<button class="chip" data-rand="${n}" type="button">${n}</button>`).join('')}
+      <span class="rand-own"><input class="field" id="randN" type="number" inputmode="numeric" min="1" max="${cs.length}" placeholder="своё"><button class="chip" data-rand="own" type="button">→</button></span>
+    </div>
+    ${topics.length ? `<div class="lbl">По теме</div>
+    <div class="chips">${topics.map(([t, n]) => `<button class="chip" data-topic="${esc(t)}" type="button">${esc(t)} · ${n}</button>`).join('')}</div>` : ''}
+    <div class="lbl">Свой набор</div>
+    <button class="btn ghost wide" data-go="pick" type="button">☑︎ Выбрать карточки вручную</button>`;
+
+  const start = ids => {
+    if (!ids.length) return toast('Нет подходящих карточек');
+    close();
+    startStudy(id, ids);
+    location.hash = '#/study/' + id;
+  };
+  body.addEventListener('click', e => {
+    const go = e.target.closest('[data-go]')?.dataset.go;
+    if (go === 'all') return start(cs.map(c => c.id));
+    if (go === 'hard') return start(hard.map(c => c.id));
+    if (go === 'pick') { close(); deckState(id).sel = new Set(); rerender(); return; }
+    const rand = e.target.closest('[data-rand]')?.dataset.rand;
+    if (rand) {
+      const n = rand === 'own' ? parseInt($('#randN', body).value, 10) : +rand;
+      if (!(n > 0)) return toast('Впиши, сколько карточек');
+      return start(shuffle(cs).slice(0, n).map(c => c.id));
+    }
+    const topic = e.target.closest('[data-topic]')?.dataset.topic;
+    if (topic) return start(cs.filter(c => (c.topics || []).includes(topic)).map(c => c.id));
+  });
+}
+
 /* ---------- card editor ---------- */
 function openEditor(deckId, cardId) {
   const card = cardId ? db.cards.find(c => c.id === cardId) : null;
-  const st = { pyTouched: !!card, trTouched: !!card, trToken: 0, writers: [] };
+  const st = {
+    pyTouched: !!card, trTouched: !!card, trToken: 0, writers: [],
+    topics: [...(card?.topics || [])],
+    // the explanation and examples belong to one word: dropped if the characters are changed
+    info: { word: card?.hanzi || '', context: card?.context || null, examples: card?.examples || null },
+  };
+  const hardHelp = helpParts(HARD_HELP);
 
   const ov = document.createElement('div');
   ov.className = 'overlay';
@@ -487,6 +735,18 @@ function openEditor(deckId, cardId) {
         <input id="edEn" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="нет в словаре — можно вписать" value="${esc(card?.en)}">
         <label class="lbl" for="edNote">Заметка</label>
         <textarea id="edNote" rows="2" placeholder="пример, ассоциация, что угодно">${esc(card?.note)}</textarea>
+        <div class="lbl">Темы <button class="link" id="edTopicsAi" type="button">✨ определить</button></div>
+        <div class="chips" id="edTopics"></div>
+        <div class="topic-add">
+          <input id="edTopicNew" placeholder="своя тема" autocomplete="off" autocapitalize="off">
+          <button class="btn small ghost" id="edTopicAdd" type="button">+ Добавить</button>
+        </div>
+        <div class="check-row">
+          <label class="check"><input type="checkbox" id="edHard" ${card && isHard(card) ? 'checked' : ''}>
+            <span>Трудная карточка <span class="lbl-note muted" id="edHardWhy">${card && isHard(card) ? `· ${esc(hardReason(card))}` : ''}</span></span></label>
+          ${hardHelp.btn}
+        </div>
+        ${hardHelp.box}
         <label class="lbl">Как писать <span class="muted" style="text-transform:none;letter-spacing:0;font-weight:400">нажми на иероглиф</span></label>
         <div class="preview" id="edPreview"></div>
         <div class="row">
@@ -494,6 +754,8 @@ function openEditor(deckId, cardId) {
           <button class="btn small ghost" id="edPractice" type="button">✍️ Пропись</button>
           <button class="btn small ghost" id="edSpeak" type="button" aria-label="Произнести">🔊</button>
         </div>
+        <div class="lbl">Примеры и объяснение</div>
+        <div class="wi" id="edInfo"></div>
         ${card ? '<button class="btn danger wide del" id="edDel" type="button">Удалить карточку</button>' : ''}
       </div>
     </div>`;
@@ -565,14 +827,82 @@ function openEditor(deckId, cardId) {
     b.remove();
   };
 
+  // topics: all shared topics as chips, the card's own ones switched on
+  const topicBox = $('#edTopics', ov);
+  const renderTopics = () => {
+    topicBox.innerHTML = db.topics.map(t =>
+      `<button class="chip ${st.topics.includes(t) ? 'on' : ''}" data-t="${esc(t)}" type="button">${esc(t)}</button>`).join('');
+  };
+  topicBox.onclick = e => {
+    const b = e.target.closest('[data-t]');
+    if (!b) return;
+    const t = b.dataset.t;
+    st.topics = st.topics.includes(t) ? st.topics.filter(x => x !== t) : [...st.topics, t];
+    b.classList.toggle('on', st.topics.includes(t));
+  };
+  const addOwnTopic = () => {
+    const t = addTopics([$('#edTopicNew', ov).value])[0];
+    if (!t) return;
+    if (!st.topics.includes(t)) st.topics.push(t);
+    $('#edTopicNew', ov).value = '';
+    save(); // the new topic joins the shared list right away
+    renderTopics();
+  };
+  $('#edTopicAdd', ov).onclick = addOwnTopic;
+  $('#edTopicNew', ov).addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addOwnTopic(); } });
+  $('#edTopicsAi', ov).onclick = async e => {
+    const h = hz.value.trim();
+    if (!h) return toast('Сначала впиши иероглиф');
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = '✨ определяю…';
+    try {
+      const found = (await aiTopics([{ hanzi: h, translation: tr.value.trim() || enIn.value.trim() }])).get(h) || [];
+      if (!found.length) toast('Не нашлось подходящей темы');
+      st.topics = [...new Set([...st.topics, ...found])];
+      save();
+      renderTopics();
+    } catch (err) {
+      toast('Не получилось определить тему: ' + err.message);
+    }
+    btn.disabled = false;
+    btn.textContent = '✨ определить';
+  };
+  renderTopics();
+
+  const hardBox = $('#edHard', ov);
+  hardBox.onchange = () => {
+    $('#edHardWhy', ov).textContent = hardBox.checked ? (card && isHard(card) ? `· ${hardReason(card)}` : '· отмечу вручную') : '';
+  };
+
+  const infoFor = word => (st.info.word === word ? st.info : { context: null, examples: null });
+  const info = mountWordInfo($('#edInfo', ov),
+    () => {
+      const word = hz.value.trim();
+      return { word, translation: tr.value.trim() || enIn.value.trim(), ...infoFor(word), word };
+    },
+    patch => {
+      const word = hz.value.trim();
+      if (st.info.word !== word) st.info = { word, context: null, examples: null };
+      Object.assign(st.info, patch);
+      // an existing card keeps what was fetched (and paid for) even if the editor is then cancelled
+      if (card && word === card.hanzi) { Object.assign(card, patch); save(); }
+    });
+
+  // everything that depends on the characters, after they were typed or picked from the list
+  function wordChanged() {
+    fillEn();
+    updatePreview();
+    info.refresh();
+    if (!st.trTouched) autoTranslate();
+  }
+
   let hzTimer;
   hz.addEventListener('input', () => {
     clearTimeout(hzTimer);
     hzTimer = setTimeout(() => {
       if (!st.pyTouched) py.value = toPinyin(hz.value.trim());
-      fillEn();
-      updatePreview();
-      if (!st.trTouched) autoTranslate();
+      wordChanged();
     }, 300);
   });
   py.addEventListener('input', () => { st.pyTouched = true; });
@@ -610,12 +940,10 @@ function openEditor(deckId, cardId) {
       st.pyTouched = false;
       st.trTouched = false;
       st.enTouched = false;
-      fillEn();
       search.value = '';
       sugg.innerHTML = '';
       search.blur();
-      updatePreview();
-      autoTranslate();
+      wordChanged();
     };
     loadDict().catch(() => {});
     setTimeout(() => search.focus(), 300);
@@ -625,9 +953,14 @@ function openEditor(deckId, cardId) {
   $('#edSave', ov).onclick = () => {
     const h = hz.value.trim();
     if (!h) { toast('Впиши иероглиф'); hz.focus(); return; }
-    const data = { hanzi: h, pinyin: py.value.trim(), translation: tr.value.trim(), en: enIn.value.trim(), note: note.value.trim() };
-    if (card) Object.assign(card, data);
-    else db.cards.push({ id: uid(), deckId, created: Date.now(), ...data });
+    const data = {
+      hanzi: h, pinyin: py.value.trim(), translation: tr.value.trim(), en: enIn.value.trim(), note: note.value.trim(),
+      topics: st.topics, context: infoFor(h).context, examples: infoFor(h).examples,
+    };
+    const target = card || { id: uid(), deckId, created: Date.now(), history: [] };
+    Object.assign(target, data);
+    if (hardBox.checked !== isHard(target)) setHard(target, hardBox.checked);
+    if (!card) db.cards.push(target);
     save();
     close();
     rerender();
@@ -766,6 +1099,11 @@ function openBulk(deckId) {
   document.body.style.overflow = 'hidden';
   const body = $('#bkBody', ov), back = $('#bkBack', ov), next = $('#bkNext', ov);
   let step = 1, text = '', split = false, items = [], token = 0, loading = false;
+  const splitHelp = helpParts(`Каждое слово превратится в карточки отдельных иероглифов.<br>
+    Например, <span lang="zh">学习 老师</span>: без галочки будут 2 карточки — <span lang="zh">学习</span> и <span lang="zh">老师</span>,
+    а с галочкой 4 — <span lang="zh">学, 习, 老, 师</span>. Повторы убираются сами.<br>
+    Удобно, чтобы учить, как пишется и что значит каждый иероглиф. Свой перевод слова при этом не сохранится —
+    у каждого иероглифа будет свой автоматический.`);
 
   const close = () => { token++; ov.remove(); document.body.style.overflow = ''; };
   ov.addEventListener('click', e => { if (e.target === ov) close(); });
@@ -786,21 +1124,9 @@ function openBulk(deckId) {
       <p class="en-hint">Каждое слово с новой строки, через пробел или запятую. Свой перевод можно сразу дописать через тире: <span lang="zh">学习</span> - учиться</p>
       <div class="check-row">
         <label class="check"><input type="checkbox" id="bkSplit" ${split ? 'checked' : ''}> Разбить слова на отдельные иероглифы</label>
-        <button class="help" id="bkSplitQ" type="button" aria-label="Что это значит?" aria-expanded="false" aria-controls="bkSplitHelp">?</button>
+        ${splitHelp.btn}
       </div>
-      <div class="help-text" id="bkSplitHelp" hidden>
-        Каждое слово превратится в карточки отдельных иероглифов.<br>
-        Например, <span lang="zh">学习 老师</span>: без галочки будут 2 карточки — <span lang="zh">学习</span> и <span lang="zh">老师</span>,
-        а с галочкой 4 — <span lang="zh">学, 习, 老, 师</span>. Повторы убираются сами.<br>
-        Удобно, чтобы учить, как пишется и что значит каждый иероглиф. Свой перевод слова при этом не сохранится —
-        у каждого иероглифа будет свой автоматический.
-      </div>`;
-    $('#bkSplitQ', ov).onclick = e => {
-      const help = $('#bkSplitHelp', ov);
-      help.hidden = !help.hidden;
-      e.currentTarget.setAttribute('aria-expanded', String(!help.hidden));
-      e.currentTarget.classList.toggle('on', !help.hidden);
-    };
+      ${splitHelp.box}`;
     $('#bkFile', ov).onchange = async e => {
       const file = e.target.files[0];
       e.target.value = '';
@@ -841,6 +1167,7 @@ function openBulk(deckId) {
     body.innerHTML = `
       <p class="en-hint" style="margin-top:0">Перевод подтягивается сам — поправь, если нужно. ✕ убирает слово из списка.</p>
       <p class="bk-progress" id="bkProgress" aria-live="polite"></p>
+      <p class="bk-progress" id="bkTopicsState" aria-live="polite"></p>
       <div class="bk-list">${items.map((it, i) => `
         <div class="bk-row ${it.on ? '' : 'off'}" data-i="${i}">
           <div class="bk-h" lang="zh">${esc(it.hanzi)}</div>
@@ -850,12 +1177,34 @@ function openBulk(deckId) {
             ${it.en ? `<div class="bk-en">EN: ${esc(it.en)}</div>` : ''}
             ${it.dup ? '<div class="bk-dup">уже есть в наборе</div>' : ''}
             <div class="bk-dup bk-note" hidden>запасной переводчик — проверь</div>
+            <div class="bk-en bk-topics"></div>
           </div>
           <button class="bk-x" data-x="${i}" type="button" aria-label="${it.on ? 'Убрать' : 'Вернуть'}">${it.on ? '✕' : '↺'}</button>
         </div>`).join('')}
       </div>`;
     updateCount();
-    translateAll();
+    translateAll().then(() => suggestTopics());
+  }
+
+  // One AI request (per 50 words) for the whole list; runs after translation, which it uses
+  // as a hint. Failing here only means no topics: the cards are still added.
+  async function suggestTopics() {
+    const my = token, state = $('#bkTopicsState', ov);
+    if (!state || !ov.isConnected) return; // the list was already saved or closed
+    state.textContent = '✨ Определяю темы…';
+    try {
+      const map = await aiTopics(items.map(it => ({ hanzi: it.hanzi, translation: it.translation || it.en })));
+      if (my !== token) return;
+      items.forEach((it, i) => {
+        it.topics = map.get(it.hanzi) || [];
+        const el = ov.querySelector(`.bk-row[data-i="${i}"] .bk-topics`);
+        if (el) el.textContent = it.topics.length ? 'темы: ' + it.topics.join(', ') : '';
+      });
+      save(); // new topic names joined the shared list
+      state.textContent = '';
+    } catch (err) {
+      if (my === token) state.textContent = `Темы не определились (${err.message}) — их можно задать потом.`;
+    }
   }
 
   function updateCount() {
@@ -954,6 +1303,7 @@ function openBulk(deckId) {
     add.forEach((it, k) => db.cards.push({
       id: uid(), deckId, created: t + k,
       hanzi: it.hanzi, pinyin: it.pinyin.trim(), translation: it.translation.trim(), en: it.en, note: '',
+      topics: it.topics || [], history: [],
     }));
     save();
     close();
@@ -1027,8 +1377,9 @@ function openPractice(text) {
 /* ---------- study ---------- */
 let S = null;
 
+// ids: the cards of this round (all, hard, random N, a topic or picked by hand)
 function startStudy(deckId, ids) {
-  S = { deckId, queue: shuffle(ids), total: ids.length, done: 0, wrong: new Set(), writers: [] };
+  S = { deckId, ids: ids.slice(), queue: shuffle(ids), total: ids.length, done: 0, wrong: new Set(), writers: [] };
 }
 
 function renderStudy(id) {
@@ -1056,15 +1407,19 @@ function showCard() {
   const front = prefs.front === 'tr'
     ? `<div class="front-tr">${esc(c.translation || c.en || '—')}</div>${c.translation && c.en ? `<div class="front-en">${esc(c.en)}</div>` : ''}`
     : `<div class="front-h" lang="zh">${esc(c.hanzi)}</div>`;
+  const badge = '<span class="hard-badge">трудная</span>';
   main.innerHTML = `
     <div class="stage"><div class="card3d" id="card">
-      <div class="face front">${front}<div class="hint">нажми, чтобы перевернуть</div></div>
+      <div class="face front">${badge}${front}<div class="hint">нажми, чтобы перевернуть</div></div>
       <div class="face back">
+        ${badge}
         <div class="writers" id="writers"></div>
         <div class="tools">
           <button class="icon" data-act="anim" aria-label="Показать порядок черт">▶</button>
           <button class="icon" data-act="speak" aria-label="Произнести">🔊</button>
           <button class="icon" data-act="practice" aria-label="Пропись">✍️</button>
+          <button class="icon" data-act="info" aria-label="Примеры и объяснение">📖</button>
+          <button class="icon flag" data-act="hard" aria-label="Трудная карточка">⚑</button>
         </div>
         <div class="b-py">${esc(c.pinyin)}</div>
         <div class="b-tr">${esc(c.translation)}</div>
@@ -1090,11 +1445,23 @@ function showCard() {
   });
 
   const card = $('#card', main);
+  const showHard = () => {
+    card.classList.toggle('is-hard', isHard(c));
+    $('.flag', card).setAttribute('aria-pressed', String(isHard(c)));
+  };
+  showHard();
   card.onclick = e => {
     const act = e.target.closest('[data-act]')?.dataset.act;
     if (act === 'anim') return animateAll(S.writers);
     if (act === 'speak') return speak(c.hanzi);
     if (act === 'practice') return openPractice(c.hanzi);
+    if (act === 'info') return openWordInfo(c);
+    if (act === 'hard') {
+      setHard(c, !isHard(c));
+      save();
+      showHard();
+      return toast(isHard(c) ? 'Отмечена трудной' : 'Метка «трудная» снята');
+    }
     card.classList.toggle('flipped');
     if (card.classList.contains('flipped')) setTimeout(() => animateAll(S.writers), 350);
     else animToken++;
@@ -1102,7 +1469,7 @@ function showCard() {
 
   const answer = ok => {
     animToken++;
-    c.last = ok ? 'ok' : 'bad';
+    recordAnswer(c, ok);
     save();
     if (ok) { S.queue.shift(); S.done++; }
     else {
@@ -1126,14 +1493,14 @@ function showDone(main) {
       <div class="done-emoji">${right === S.total ? '🎉' : '💪'}</div>
       <h2>Готово!</h2>
       <p>С первого раза: ${right} из ${S.total}</p>
-      ${S.wrong.size ? `<button class="btn primary wide" id="againWrong">Повторить трудные · ${S.wrong.size}</button>` : ''}
+      ${S.wrong.size ? `<button class="btn primary wide" id="againWrong">Повторить ошибки этого круга · ${S.wrong.size}</button>` : ''}
       <button class="btn wide" id="againAll">Пройти ещё раз</button>
       <a class="btn ghost wide" href="#/deck/${S.deckId}">К набору</a>
     </div>`;
-  const deckId = S.deckId, wrong = [...S.wrong];
+  const deckId = S.deckId, wrong = [...S.wrong], ids = S.ids;
   const again = $('#againWrong', main);
   if (again) again.onclick = () => { startStudy(deckId, wrong); showCard(); };
-  $('#againAll', main).onclick = () => { startStudy(deckId, cardsOf(deckId).map(c => c.id)); showCard(); };
+  $('#againAll', main).onclick = () => { startStudy(deckId, ids); showCard(); };
 }
 
 /* ---------- start ---------- */

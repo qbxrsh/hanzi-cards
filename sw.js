@@ -2,7 +2,7 @@
 // stroke data are cache-first. Translation requests always go to the network.
 const CACHE = 'hanzi-cards-v1';
 const SHELL = [
-  './', './index.html', './style.css', './app.js', './dict.txt',
+  './', './index.html', './style.css', './ai.js', './app.js', './dict.txt',
   './manifest.webmanifest', './icon-180.png', './icon-512.png',
   'https://cdn.jsdelivr.net/npm/hanzi-writer@3.7.2/dist/hanzi-writer.min.js',
   'https://cdn.jsdelivr.net/npm/pinyin-pro@3.26.0/dist/index.js',
